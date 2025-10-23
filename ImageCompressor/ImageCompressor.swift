@@ -7,12 +7,36 @@ import UniformTypeIdentifiers
 import CoreGraphics
 
 class ImageCompressor: ObservableObject {
+    // User options
+    @AppStorage("deleteOriginals") private var deleteOriginals: Bool = true
+    @AppStorage("convertPNGsToJPEG") private var convertPNGsToJPEG: Bool = true
+
+    // Persistence keys
+    private let processedFilesKey = "processedFiles"
+    private let lastScanDateKey = "lastScanDate"
+
     // Monitor only the Downloads folder
     private let downloadsFolder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
 
     private var folderMonitors: [DispatchSourceFileSystemObject] = []
 
     @Published var logs: [String] = []
+
+    // Persisted state
+    private var processedFiles: Set<String> {
+        get {
+            let arr = UserDefaults.standard.stringArray(forKey: processedFilesKey) ?? []
+            return Set(arr)
+        }
+        set {
+            UserDefaults.standard.set(Array(newValue), forKey: processedFilesKey)
+        }
+    }
+
+    private var lastScanDate: Date {
+        get { UserDefaults.standard.object(forKey: lastScanDateKey) as? Date ?? .distantPast }
+        set { UserDefaults.standard.set(newValue, forKey: lastScanDateKey) }
+    }
 
     init() {
         createFolderIfNeeded()
@@ -75,38 +99,51 @@ class ImageCompressor: ObservableObject {
         log("👀 Monitoring enabled: \(folder.lastPathComponent)")
     }
 
+    private func fileModificationDate(_ url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
+    }
+
     private func checkForNewImages(in folder: URL) {
-        log("📂 Scanning folder: \(folder.lastPathComponent)")
+        // Capture current time to move the watermark only after we finish processing
+        let scanStart = Date()
+
         guard let files = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
             log("⚠️ Failed to read folder contents")
             return
         }
 
-        for file in files {
-            // Filter hidden/temp files
-            let name = file.lastPathComponent
-            if name.hasPrefix(".") || name.hasPrefix("~") {
-                continue
-            }
+        let supported = Set(["png", "jpg", "jpeg", "heic", "webp", "tiff", "tif"])
 
-            // Extension and supported formats
-            let ext = file.pathExtension.lowercased()
-            let supported = ["png", "jpg", "jpeg", "heic", "webp", "tiff"]
-            guard supported.contains(ext) else {
-                log("⛔ Skipped (unsupported format): \(file.lastPathComponent)")
-                continue
-            }
+        // Consider only candidates that are:
+        // - supported type
+        // - not already processed
+        // - modified at or after lastScanDate
+        let candidates: [URL] = files.compactMap { url in
+            let name = url.lastPathComponent
+            if name.hasPrefix(".") || name.hasPrefix("~") { return nil }
 
-            // Skip files already having _lite suffix
-            let baseName = file.deletingPathExtension().lastPathComponent
-            if baseName.hasSuffix("_lite") {
-                log("↩️ Skipped (already _lite): \(file.lastPathComponent)")
-                continue
-            }
+            let ext = url.pathExtension.lowercased()
+            if !supported.contains(ext) { return nil }
 
-            log("📥 Found file: \(file.lastPathComponent)")
-            compressImageKeepingFormat(at: file, originalExtension: ext)
+            let baseName = url.deletingPathExtension().lastPathComponent
+            if baseName.hasSuffix("_lite") { return nil }
+
+            if processedFiles.contains(url.path) { return nil }
+
+            guard let mdate = fileModificationDate(url), mdate >= lastScanDate else { return nil }
+
+            return url
         }
+
+        guard !candidates.isEmpty else { return }
+
+        for file in candidates {
+            log("📥 New file: \(file.lastPathComponent)")
+            compressImageKeepingFormat(at: file, originalExtension: file.pathExtension.lowercased())
+        }
+
+        // Move watermark forward only after we attempted to process new files
+        lastScanDate = scanStart
     }
 
     // Check if writing to a given UTI type is supported
@@ -115,15 +152,26 @@ class ImageCompressor: ObservableObject {
         return ids.contains { $0 as String == (type as String) }
     }
 
-    // Route by format: try to preserve original format, fallback to JPEG
+    // Detect if CGImage has alpha
+    private func hasAlpha(_ image: CGImage) -> Bool {
+        let alpha = image.alphaInfo
+        switch alpha {
+        case .first, .last, .premultipliedFirst, .premultipliedLast, .alphaOnly:
+            return true
+        default:
+            return false
+        }
+    }
+
+    // Route by format: try to preserve original format, or convert PNG->JPEG if enabled and safe
     private func compressImageKeepingFormat(at url: URL, originalExtension: String) {
-        // Load via CGImageSource
+        // Load via CGImageSource (no downsampling)
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             log("❌ Failed to create CGImageSource: \(url.lastPathComponent)")
             return
         }
 
-        // Read first image
+        // Read first image (full size)
         guard let cgImage = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
             log("❌ Failed to read image: \(url.lastPathComponent)")
             return
@@ -132,29 +180,28 @@ class ImageCompressor: ObservableObject {
         // Determine source UTI
         let sourceType = CGImageSourceGetType(src)
 
-        // Prepare output URL (same folder, name + _lite + original extension)
+        // Prepare output URL (same folder, name + _lite + extension)
         let baseName = url.deletingPathExtension().lastPathComponent
-        let outURL = url.deletingLastPathComponent().appendingPathComponent("\(baseName)_lite.\(originalExtension)")
 
-        // Overwrite if exists
-        if FileManager.default.fileExists(atPath: outURL.path) {
-            do { try FileManager.default.removeItem(at: outURL) } catch { /* ignore */ }
-        }
-
-        // Determine destinationType: if source is write-supported — keep it, else JPEG
+        // Destination format selection
         let jpegUTI = UTType.jpeg.identifier as CFString
         let pngUTI = UTType.png.identifier as CFString
         let tiffUTI = UTType.tiff.identifier as CFString
-        // HEIC and WebP might be missing in UTType on some systems, use string UTIs
         let heicUTI: CFString = (UTType.heic.identifier as CFString? ) ?? "public.heic" as CFString
         let webpUTI: CFString = "public.webp" as CFString
 
+        // If it's PNG and user allows conversion, and there's no alpha — convert to JPEG
+        var forceJPEGForPNG = false
+        if originalExtension == "png", convertPNGsToJPEG, !hasAlpha(cgImage) {
+            forceJPEGForPNG = true
+        }
+
         let preferredType: CFString? = sourceType
         let destinationType: CFString = {
+            if forceJPEGForPNG { return jpegUTI }
             if let t = preferredType, supportsWriting(type: t) {
                 return t
             }
-            // If source not supported for writing, map by extension if possible
             switch originalExtension {
             case "jpg", "jpeg": return jpegUTI
             case "png": return pngUTI
@@ -165,20 +212,39 @@ class ImageCompressor: ObservableObject {
             }
         }()
 
-        // Compression properties (where applicable)
+        // Output URL depends on destinationType
+        let outExt: String = {
+            let s = destinationType as String
+            if s == (jpegUTI as String) { return "jpeg" }
+            if s == (pngUTI as String) { return "png" }
+            if s == (tiffUTI as String) { return "tiff" }
+            if s == (heicUTI as String) { return "heic" }
+            if s == (webpUTI as String) { return "webp" }
+            return originalExtension // fallback
+        }()
+        let outURL = url.deletingLastPathComponent().appendingPathComponent("\(baseName)_lite.\(outExt)")
+
+        // Overwrite if exists
+        if FileManager.default.fileExists(atPath: outURL.path) {
+            do { try FileManager.default.removeItem(at: outURL) } catch { /* ignore */ }
+        }
+
+        // Compression properties — keep size, just adjust quality for lossy formats
         var props: [CFString: Any] = [:]
-        let lossyQuality: CGFloat = 0.6
+        let lossyQuality: CGFloat = 0.7 // немного выше для лучшего качества/размера
 
         let destTypeString = destinationType as String
         if destTypeString == (jpegUTI as String) ||
             destTypeString == (heicUTI as String) ||
             destTypeString == (webpUTI as String) {
             props[kCGImageDestinationLossyCompressionQuality] = lossyQuality
-        } else if destTypeString == (pngUTI as String) {
-            // PNG — lossless (keep default)
-        } else if destTypeString == (tiffUTI as String) {
-            // TIFF — keep default
         }
+
+        // Copy ALL metadata/properties from source (DPI/EXIF/Orientation/Profiles)
+        let metadata = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        var addProps = metadata ?? [:]
+        addProps[kCGImageDestinationEmbedThumbnail] = false
+        for (k, v) in props { addProps[k] = v }
 
         // Create destination
         guard let dst = CGImageDestinationCreateWithURL(outURL as CFURL, destinationType, 1, nil) else {
@@ -186,19 +252,23 @@ class ImageCompressor: ObservableObject {
             return
         }
 
-        // Copy basic metadata
-        let metadata = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
-        let addProps = metadata != nil ? props.merging(metadata!) { current, _ in current } : props
-
         CGImageDestinationAddImage(dst, cgImage, addProps as CFDictionary)
 
         if CGImageDestinationFinalize(dst) {
-            // Remove original file
-            try? FileManager.default.removeItem(at: url)
-            log("✅ Compressed (format preserved): \(url.lastPathComponent) → \(outURL.lastPathComponent); original removed")
+            // Mark as processed
+            var set = processedFiles
+            set.insert(url.path)
+            processedFiles = set
+
+            if deleteOriginals {
+                try? FileManager.default.removeItem(at: url)
+                log("✅ Compressed: \(url.lastPathComponent) → \(outURL.lastPathComponent); original removed")
+            } else {
+                log("✅ Compressed: \(url.lastPathComponent) → \(outURL.lastPathComponent); original kept")
+            }
         } else {
             // Fallback: try JPEG if finalize failed
-            log("⚠️ Failed to save with original format. Trying JPEG…")
+            log("⚠️ Failed to save with chosen format. Trying JPEG…")
             compressToJPEGFallback(cgImage: cgImage, originalURL: url, baseName: baseName)
         }
     }
@@ -215,14 +285,31 @@ class ImageCompressor: ObservableObject {
             return
         }
 
-        let props: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: CGFloat(0.6)
+        // Keep size; set only quality; no downsampling
+        var props: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: CGFloat(0.7),
+            kCGImageDestinationEmbedThumbnail: false
         ]
+
+        // Try to copy metadata from source file
+        if let src = CGImageSourceCreateWithURL(originalURL as CFURL, nil),
+           let metadata = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] {
+            for (k, v) in metadata { props[k] = v }
+        }
+
         CGImageDestinationAddImage(dst, cgImage, props as CFDictionary)
 
         if CGImageDestinationFinalize(dst) {
-            try? FileManager.default.removeItem(at: originalURL)
-            log("✅ Fallback JPEG: \(originalURL.lastPathComponent) → \(outURL.lastPathComponent); original removed")
+            var set = processedFiles
+            set.insert(originalURL.path)
+            processedFiles = set
+
+            if deleteOriginals {
+                try? FileManager.default.removeItem(at: originalURL)
+                log("✅ Fallback JPEG: \(originalURL.lastPathComponent) → \(outURL.lastPathComponent); original removed")
+            } else {
+                log("✅ Fallback JPEG: \(originalURL.lastPathComponent) → \(outURL.lastPathComponent); original kept")
+            }
         } else {
             log("❌ Fallback: failed to save JPEG for \(originalURL.lastPathComponent)")
         }
@@ -269,16 +356,18 @@ class ImageCompressor: ObservableObject {
         for url in urls {
             handlePickedURL(url, supported: supported)
         }
+        // After manual selection, also advance watermark
+        lastScanDate = Date()
     }
 
     private func handlePickedURL(_ url: URL, supported: Set<String>) {
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
             log("📁 Selected folder: \(url.lastPathComponent)")
-            // Process folder same as monitoring
+            // Process only new images inside the folder
             checkForNewImages(in: url)
         } else {
-            // Process single file
+            // Process single file if it's new and not processed yet
             let name = url.lastPathComponent
             if name.hasPrefix(".") || name.hasPrefix("~") {
                 log("⛔ Skipped hidden/temp file: \(name)")
@@ -294,6 +383,13 @@ class ImageCompressor: ObservableObject {
                 log("↩️ Skipped (already _lite): \(name)")
                 return
             }
+            guard !processedFiles.contains(url.path),
+                  let mdate = fileModificationDate(url),
+                  mdate >= lastScanDate else {
+                log("↩️ Skipped (already processed or old): \(name)")
+                return
+            }
+
             log("📥 Processing file: \(name)")
             compressImageKeepingFormat(at: url, originalExtension: ext)
         }
